@@ -3,6 +3,7 @@ import cors from "cors";
 import cookieParser from "cookie-parser";
 import { config } from "./config.js";
 import authRoutes from "./routes/auth.js";
+import conversationsRoutes from "./routes/conversations.js";
 import modelsRoutes from "./routes/models.js";
 import reposRoutes from "./routes/repos.js";
 
@@ -19,6 +20,7 @@ app.get("/health", (_req, res) => {
 app.use("/auth", authRoutes);
 app.use("/repos", reposRoutes);
 app.use("/models", modelsRoutes);
+app.use("/conversations", conversationsRoutes);
 
 app.listen(config.PORT, () => {
   console.log(`🚀 docforge-backend listening on http://localhost:${config.PORT}`);

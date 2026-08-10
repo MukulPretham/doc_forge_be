@@ -1,4 +1,4 @@
-import { END, INTERRUPT, START, StateGraph, isInterrupted } from "@langchain/langgraph";
+import { Command, END, INTERRUPT, START, StateGraph, isInterrupted } from "@langchain/langgraph";
 import { getCheckpointer } from "./checkpointer.js";
 import { createPr, draftDocs, explore, fetchTree, review, selectFiles } from "./nodes.js";
 import { AgentState, type AgentStateType } from "./state.js";
@@ -48,7 +48,7 @@ export interface AgentRunEvent {
 
 export interface RunAgentOptions {
   threadId: string;
-  input: Record<string, unknown>;
+  input: unknown;
 }
 
 export async function* runAgent({
@@ -58,7 +58,7 @@ export async function* runAgent({
   const graph = await getAgentGraph();
   const config = { configurable: { thread_id: threadId }, recursionLimit: 50 };
 
-  const stream = await graph.stream(input, {
+  const stream = await graph.stream(input as never, {
     ...config,
     streamMode: ["updates", "messages"],
   });
