@@ -51,6 +51,7 @@ const providers: ProviderDefinition[] = [
         configuration: { baseURL: OPENROUTER_BASE_URL },
       }),
     models: [
+      { id: "auto", label: "Auto (best available)" },
       { id: "deepseek/deepseek-chat-v3-0324", label: "DeepSeek V3" },
       { id: "deepseek/deepseek-r1", label: "DeepSeek R1" },
       { id: "qwen/qwen-2.5-coder-32b-instruct", label: "Qwen 2.5 Coder 32B" },
