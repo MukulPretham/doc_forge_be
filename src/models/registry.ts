@@ -1,5 +1,6 @@
 import type { BaseChatModel } from "@langchain/core/language_models/chat_models";
 import { ChatAnthropic } from "@langchain/anthropic";
+import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
 import { ChatGroq } from "@langchain/groq";
 import { ChatOpenAI } from "@langchain/openai";
 import { config } from "../config.js";
@@ -20,6 +21,22 @@ export interface ProviderDefinition {
 const OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1";
 
 const providers: ProviderDefinition[] = [
+  {
+    id: "google_genai",
+    label: "Google Gemini",
+    key: config.GEMINI_API_KEY,
+    build: (model) =>
+      new ChatGoogleGenerativeAI({
+        model,
+        apiKey: config.GEMINI_API_KEY,
+        streaming: true,
+      }),
+    models: [
+      { id: "gemini-2.5-flash", label: "Gemini 2.5 Flash" },
+      { id: "gemini-2.0-flash", label: "Gemini 2.0 Flash" },
+      { id: "gemini-2.5-pro", label: "Gemini 2.5 Pro" },
+    ],
+  },
   {
     id: "openrouter",
     label: "OpenRouter",
