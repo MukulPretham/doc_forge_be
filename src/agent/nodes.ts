@@ -61,7 +61,7 @@ export async function selectFiles(state: AgentStateType) {
   const result = (await modelCall(structured, [
     new SystemMessage(selectFilesPrompt(state)),
     new HumanMessage(state.userMessage),
-  ])) as { files: { path: string; reason: string }[] };
+  ], state.provider!, state.model!)) as { files: { path: string; reason: string }[] };
 
   const summary = new AIMessage(
     `Selected ${result.files.length} file(s) to explore:\n${result.files.map((f) => `- ${f.path}`).join("\n")}`,
@@ -90,7 +90,7 @@ export async function explore(state: AgentStateType, config: RunnableConfig) {
   const seen = new Set(explored.map((f) => f.path));
 
   for (let round = 0; round < 6; round++) {
-    const res = (await modelCall(model, local)) as AIMessage;
+    const res = (await modelCall(model, local, state.provider!, state.model!)) as AIMessage;
     local.push(res);
 
     const calls = res.tool_calls ?? [];
@@ -150,7 +150,7 @@ export async function draftDocs(state: AgentStateType, config: RunnableConfig) {
   let draftCount = state.drafts.length;
 
   for (let round = 0; round < 8; round++) {
-    const res = (await modelCall(model, local)) as AIMessage;
+    const res = (await modelCall(model, local, state.provider!, state.model!)) as AIMessage;
     local.push(res);
 
     const calls = res.tool_calls ?? [];

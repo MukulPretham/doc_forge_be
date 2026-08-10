@@ -3,8 +3,10 @@ import { Command } from "@langchain/langgraph";
 import { Router } from "express";
 import { z } from "zod";
 import { getAgentGraph, runAgent } from "../agent/graph.js";
+import { ModelQuotaError } from "../agent/retry.js";
 import { prisma } from "../db/prisma.js";
 import { getProvider } from "../models/registry.js";
+import { markQuotaExhausted } from "../models/health.js";
 import { requireAuth } from "../middleware/auth.js";
 
 const router = Router();
@@ -115,6 +117,19 @@ function sseHeaders(res: { setHeader: (k: string, v: string) => void; flushHeade
   res.flushHeaders?.();
 }
 
+function sendAgentError(res: { write: (chunk: string) => boolean }, conversationId: string, err: unknown) {
+  const message = (err as Error).message ?? "Unknown error";
+  if (err instanceof ModelQuotaError) {
+    markQuotaExhausted(err.provider, err.model, message);
+    sendEvent(res, "error", { quota: true, provider: err.provider, model: err.model, message });
+  } else {
+    sendEvent(res, "error", { message });
+  }
+  prisma.conversation
+    .update({ where: { id: conversationId }, data: { status: "error" } })
+    .catch(() => {});
+}
+
 router.post("/:id/stream", requireAuth, async (req, res) => {
   const conversation = await loadConversationOrNull(String(req.params.id), req.user!.id);
   if (!conversation) {
@@ -197,10 +212,7 @@ router.post("/:id/stream", requireAuth, async (req, res) => {
     sendEvent(res, "done", { status: finalStatus });
   } catch (err) {
     console.error("Agent run failed:", err);
-    sendEvent(res, "error", { message: (err as Error).message });
-    await prisma.conversation
-      .update({ where: { id: conversation.id }, data: { status: "error" } })
-      .catch(() => {});
+    sendAgentError(res, conversation.id, err);
   }
 
   res.end();
@@ -263,10 +275,7 @@ router.post("/:id/push", requireAuth, async (req, res) => {
     });
   } catch (err) {
     console.error("Push failed:", err);
-    sendEvent(res, "error", { message: (err as Error).message });
-    await prisma.conversation
-      .update({ where: { id: conversation.id }, data: { status: "error" } })
-      .catch(() => {});
+    sendAgentError(res, conversation.id, err);
   }
 
   res.end();

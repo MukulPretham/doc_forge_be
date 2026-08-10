@@ -4,10 +4,12 @@ import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
 import { ChatGroq } from "@langchain/groq";
 import { ChatOpenAI } from "@langchain/openai";
 import { config } from "../config.js";
+import { getModelHealth, type ModelHealthStatus } from "./health.js";
 
 export interface ModelDefinition {
   id: string;
   label: string;
+  status?: ModelHealthStatus;
 }
 
 export interface ProviderDefinition {
@@ -95,7 +97,11 @@ const providers: ProviderDefinition[] = [
 export function getConfiguredProviders(): Omit<ProviderDefinition, "key" | "build">[] {
   return providers
     .filter((p) => p.key)
-    .map(({ id, label, models }) => ({ id, label, models }));
+    .map(({ id, label, models }) => ({
+      id,
+      label,
+      models: models.map((m) => ({ ...m, status: getModelHealth(id, m.id) })),
+    }));
 }
 
 export function getProvider(providerId: string): ProviderDefinition | undefined {
