@@ -2,6 +2,7 @@ import { Router } from "express";
 import { getOctokit } from "../github/client.js";
 import { requireAuth } from "../middleware/auth.js";
 import { prisma } from "../db/prisma.js";
+import { log } from "../logger.js";
 
 const router = Router();
 
@@ -24,6 +25,7 @@ router.get("/", requireAuth, async (req, res, next) => {
           });
           const state = data.state ?? pr.state;
           if (state !== pr.state) {
+            log.info(`pr state change #${pr.number} ${pr.state} → ${state}`);
             await prisma.pullRequest.update({
               where: { id: pr.id },
               data: { state, title: data.title ?? pr.title },
@@ -41,6 +43,7 @@ router.get("/", requireAuth, async (req, res, next) => {
             createdAt: pr.createdAt,
           };
         } catch (err) {
+          log.warn(`pr refresh failed #${pr.number} ${pr.repoOwner}/${pr.repoName}: ${(err as Error).message.slice(0, 120)}`);
           return {
             id: pr.id,
             repoOwner: pr.repoOwner,
@@ -57,6 +60,7 @@ router.get("/", requireAuth, async (req, res, next) => {
       }),
     );
 
+    log.info(`prs list by=${req.user!.login} count=${refreshed.length}`);
     res.json({ pullRequests: refreshed });
   } catch (err) {
     next(err);

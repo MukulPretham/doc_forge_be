@@ -7,6 +7,7 @@ import { ModelQuotaError } from "../agent/retry.js";
 import { prisma } from "../db/prisma.js";
 import { getProvider } from "../models/registry.js";
 import { markQuotaExhausted } from "../models/health.js";
+import { log } from "../logger.js";
 import { requireAuth } from "../middleware/auth.js";
 
 const router = Router();
@@ -51,6 +52,7 @@ router.post("/", requireAuth, async (req, res, next) => {
       },
     });
 
+    log.ok(`conversation created id=${conversation.id} ${repoOwner}/${repoName}@${branch} model=${provider}/${model} by=${req.user!.login}`);
     res.status(201).json({ conversation });
   } catch (err) {
     next(err);
@@ -66,6 +68,7 @@ router.get("/", requireAuth, async (req, res, next) => {
         _count: { select: { messages: true, drafts: true } },
       },
     });
+    log.info(`conversations list by=${req.user!.login} count=${conversations.length}`);
     res.json({ conversations });
   } catch (err) {
     next(err);
@@ -83,6 +86,7 @@ router.get("/:id/messages", requireAuth, async (req, res, next) => {
       where: { conversationId: conversation.id },
       orderBy: { createdAt: "asc" },
     });
+    log.info(`messages list conv=${conversation.id} count=${messages.length}`);
     res.json({ messages });
   } catch (err) {
     next(err);
@@ -100,6 +104,7 @@ router.get("/:id/drafts", requireAuth, async (req, res, next) => {
       where: { conversationId: conversation.id, status: "draft" },
       orderBy: { path: "asc" },
     });
+    log.info(`drafts list conv=${conversation.id} count=${drafts.length} status=${conversation.status}`);
     res.json({ drafts, conversation });
   } catch (err) {
     next(err);
@@ -121,6 +126,7 @@ function sendAgentError(res: { write: (chunk: string) => boolean }, conversation
   const message = (err as Error).message ?? "Unknown error";
   if (err instanceof ModelQuotaError) {
     markQuotaExhausted(err.provider, err.model, message);
+    log.warn(`quota marked exhausted provider=${err.provider} model=${err.model}`);
     sendEvent(res, "error", { quota: true, provider: err.provider, model: err.model, message });
   } else {
     sendEvent(res, "error", { message });
@@ -152,9 +158,11 @@ router.post("/:id/stream", requireAuth, async (req, res) => {
     return res.status(400).json({ error: "message is required" });
   }
   if (conversation.status === "pr_open") {
+    log.warn(`stream rejected conv=${conversation.id} — already pushed`);
     return res.status(409).json({ error: "Conversation already pushed. Start a new conversation." });
   }
   if (conversation.status === "running") {
+    log.warn(`stream rejected conv=${conversation.id} — already running`);
     return res.status(409).json({ error: "Conversation is already running" });
   }
 
@@ -165,6 +173,7 @@ router.post("/:id/stream", requireAuth, async (req, res) => {
     where: { id: conversation.id },
     data: { status: "running" },
   });
+  log.info(`stream start conv=${conversation.id} by=${req.user!.login} msg="${message.slice(0, 60)}${message.length > 60 ? "…" : ""}" resume=${conversation.status === "review"}`);
 
   sseHeaders(res);
   const keepalive = startKeepalive(res);
@@ -187,9 +196,13 @@ router.post("/:id/stream", requireAuth, async (req, res) => {
 
     for await (const event of runAgent({ threadId, input })) {
       if (event.type === "token") sendEvent(res, "token", { content: event.content });
-      else if (event.type === "node") sendEvent(res, "node", { node: event.node, data: event.data });
-      else if (event.type === "interrupt") sendEvent(res, "interrupt", event.data ?? {});
-      else if (event.type === "end") sendEvent(res, "end", event.data ?? {});
+      else if (event.type === "node") {
+        log.info(`sse node conv=${threadId} → ${event.node}`);
+        sendEvent(res, "node", { node: event.node, data: event.data });
+      } else if (event.type === "interrupt") {
+        log.info(`sse interrupt conv=${threadId} → review`);
+        sendEvent(res, "interrupt", event.data ?? {});
+      } else if (event.type === "end") sendEvent(res, "end", event.data ?? {});
     }
 
     const graph = await getAgentGraph();
@@ -223,8 +236,10 @@ router.post("/:id/stream", requireAuth, async (req, res) => {
     });
 
     sendEvent(res, "done", { status: finalStatus });
+    log.ok(`stream done conv=${conversation.id} status=${finalStatus} storedMsgs=${fresh.length}`);
   } catch (err) {
     console.error("Agent run failed:", err);
+    log.error(`stream error conv=${conversation.id} type=${(err as Error).name} msg=${(err as Error).message.slice(0, 200)}`);
     sendAgentError(res, conversation.id, err);
   }
 
@@ -238,9 +253,11 @@ router.post("/:id/push", requireAuth, async (req, res) => {
     return res.status(404).json({ error: "Conversation not found" });
   }
   if (conversation.status !== "review") {
+    log.warn(`push rejected conv=${conversation.id} — status=${conversation.status} (not review)`);
     return res.status(409).json({ error: "Conversation is not in review state" });
   }
 
+  log.info(`push start conv=${conversation.id} by=${req.user!.login}`);
   sseHeaders(res);
   const keepalive = startKeepalive(res);
 
@@ -255,8 +272,10 @@ router.post("/:id/push", requireAuth, async (req, res) => {
       input: new Command({ resume: { action: "push", feedback: "" } }),
     })) {
       if (event.type === "token") sendEvent(res, "token", { content: event.content });
-      else if (event.type === "node") sendEvent(res, "node", { node: event.node, data: event.data });
-      else if (event.type === "interrupt") sendEvent(res, "interrupt", event.data ?? {});
+      else if (event.type === "node") {
+        log.info(`sse node conv=${conversation.id} → ${event.node}`);
+        sendEvent(res, "node", { node: event.node, data: event.data });
+      } else if (event.type === "interrupt") sendEvent(res, "interrupt", event.data ?? {});
       else if (event.type === "end") sendEvent(res, "end", event.data ?? {});
     }
 
@@ -283,6 +302,7 @@ router.post("/:id/push", requireAuth, async (req, res) => {
     }
 
     const prRow = await prisma.pullRequest.findUnique({ where: { conversationId: conversation.id } });
+    log.ok(`push done conv=${conversation.id} pr=${prRow ? `#${prRow.number} ${prRow.url}` : "none"}`);
     sendEvent(res, "done", {
       status: "pr_open",
       prUrl: prRow?.url ?? null,
@@ -290,6 +310,7 @@ router.post("/:id/push", requireAuth, async (req, res) => {
     });
   } catch (err) {
     console.error("Push failed:", err);
+    log.error(`push error conv=${conversation.id} type=${(err as Error).name} msg=${(err as Error).message.slice(0, 200)}`);
     sendAgentError(res, conversation.id, err);
   }
 

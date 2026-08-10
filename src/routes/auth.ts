@@ -5,6 +5,7 @@ import { config } from "../config.js";
 import { prisma } from "../db/prisma.js";
 import { encrypt } from "../github/crypto.js";
 import { exchangeCode, getOAuthURL } from "../github/oauth.js";
+import { log } from "../logger.js";
 import {
   createSessionToken,
   hashToken,
@@ -19,10 +20,12 @@ const TTL_MS = 30 * 24 * 60 * 60 * 1000;
 
 router.get("/github", (_req, res) => {
   if (!config.GITHUB_CLIENT_ID || !config.GITHUB_CLIENT_SECRET) {
+    log.error("OAuth start blocked — GitHub OAuth not configured");
     return res.status(503).json({ error: "GitHub OAuth not configured on the server" });
   }
   const state = crypto.randomBytes(16).toString("hex");
   res.cookie(STATE_COOKIE, state, { httpOnly: true, sameSite: "lax", maxAge: 10 * 60 * 1000 });
+  log.info(`oauth start state=${state.slice(0, 8)}… → redirecting to GitHub`);
   res.redirect(getOAuthURL(state));
 });
 
@@ -33,6 +36,7 @@ router.get("/github/callback", async (req, res) => {
   res.clearCookie(STATE_COOKIE);
 
   if (typeof code !== "string" || typeof state !== "string" || state !== savedState) {
+    log.warn(`oauth callback rejected — invalid state (code=${typeof code}, state=${typeof state})`);
     return res.redirect(`${config.FRONTEND_URL}/?error=invalid_oauth_state`);
   }
 
@@ -66,9 +70,11 @@ router.get("/github/callback", async (req, res) => {
     });
 
     res.cookie(SESSION_COOKIE, sessionToken, { httpOnly: true, sameSite: "lax", maxAge: TTL_MS });
+    log.ok(`oauth callback success → ${user.login} (${user.id})`);
     res.redirect(`${config.FRONTEND_URL}/chat`);
   } catch (err) {
     console.error("OAuth callback failed:", err);
+    log.error("oauth callback failed");
     res.redirect(`${config.FRONTEND_URL}/?error=oauth_failed`);
   }
 });
@@ -81,6 +87,7 @@ router.get("/me", requireAuth, (req, res) => {
 router.post("/logout", requireAuth, async (req, res) => {
   await prisma.session.delete({ where: { id: req.session!.id } }).catch(() => {});
   res.clearCookie(SESSION_COOKIE);
+  log.info(`logout ${req.user!.login} session=${req.session!.id}`);
   res.json({ ok: true });
 });
 

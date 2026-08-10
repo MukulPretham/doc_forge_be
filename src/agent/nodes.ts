@@ -10,6 +10,7 @@ import { interrupt } from "@langchain/langgraph";
 import { z } from "zod";
 import { prisma } from "../db/prisma.js";
 import { getOctokit } from "../github/client.js";
+import { log } from "../logger.js";
 import { createChatModel } from "../models/registry.js";
 import { draftDocsPrompt, explorePrompt, selectFilesPrompt } from "./prompts.js";
 import { modelCall } from "./retry.js";
@@ -42,6 +43,7 @@ async function getCtx(state: AgentStateType, config: RunnableConfig): Promise<To
 export async function fetchTree(state: AgentStateType, config: RunnableConfig) {
   const ctx = await getCtx(state, config);
   const tree = await getRepoTree(ctx.octokit, state.repoOwner, state.repoName, state.branch);
+  log.info(`node fetch_tree conv=${ctx.conversationId} ${state.repoOwner}/${state.repoName}@${state.branch} entries=${tree.length}`);
   return { tree };
 }
 
@@ -66,6 +68,7 @@ export async function selectFiles(state: AgentStateType) {
   const summary = new AIMessage(
     `Selected ${result.files.length} file(s) to explore:\n${result.files.map((f) => `- ${f.path}`).join("\n")}`,
   );
+  log.info(`node select_files model=${state.provider}/${state.model} files=${result.files.map((f) => f.path).join(",")}`);
   return { selectedFiles: result.files, messages: [summary] };
 }
 
@@ -127,6 +130,7 @@ export async function explore(state: AgentStateType, config: RunnableConfig) {
     }
   }
 
+  log.info(`node explore conv=${ctx.conversationId} reads=${readCount} explored=${explored.length} rounds=${Math.min(6, Math.ceil(local.length - baseLen))}`);
   return { explored, readCount, messages: local.slice(baseLen) };
 }
 
@@ -185,6 +189,7 @@ export async function draftDocs(state: AgentStateType, config: RunnableConfig) {
   }
 
   local.push(new AIMessage(`Drafting complete. ${drafts.size} document(s) staged for review.`));
+  log.ok(`node draft_docs conv=${ctx.conversationId} drafts=${[...drafts.values()].map((d) => d.path).join(",")}`);
   return { drafts: [...drafts.values()], messages: local.slice(baseLen) };
 }
 
@@ -300,6 +305,7 @@ Generated from branch \`${branch}\`.`;
   });
 
   const prResult: PrResult = { url: pr.html_url, number: pr.number, branch: workBranch };
+  log.ok(`node create_pr conv=${conversationId} ${repoOwner}/${repoName} branch=${workBranch} PR #${pr.number} ${pr.html_url}`);
 
   await prisma.$transaction([
     prisma.pullRequest.upsert({

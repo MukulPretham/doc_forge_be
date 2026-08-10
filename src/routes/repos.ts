@@ -1,5 +1,6 @@
 import { Router } from "express";
 import { getOctokit } from "../github/client.js";
+import { log } from "../logger.js";
 import { requireAuth } from "../middleware/auth.js";
 
 const router = Router();
@@ -12,6 +13,8 @@ router.get("/", requireAuth, async (req, res, next) => {
       sort: "updated",
       visibility: "all",
     });
+
+    log.info(`repos list by=${req.user!.login} count=${repos.length}`);
 
     res.json(
       repos.map((r) => ({
