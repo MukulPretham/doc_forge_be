@@ -6,8 +6,8 @@ const envSchema = z.object({
   PORT: z.coerce.number().default(4000),
   DATABASE_URL: z.string().min(1, "DATABASE_URL is required (Neon Postgres connection string)"),
   APP_SECRET: z.string().min(32, "APP_SECRET must be at least 32 characters"),
-  GITHUB_CLIENT_ID: z.string().min(1, "GITHUB_CLIENT_ID is required"),
-  GITHUB_CLIENT_SECRET: z.string().min(1, "GITHUB_CLIENT_SECRET is required"),
+  GITHUB_CLIENT_ID: z.string().optional(),
+  GITHUB_CLIENT_SECRET: z.string().optional(),
   GITHUB_REDIRECT_URI: z
     .string()
     .url()
@@ -29,3 +29,7 @@ if (!parsed.success) {
 }
 
 export const config = parsed.data;
+
+if (!config.GITHUB_CLIENT_ID || !config.GITHUB_CLIENT_SECRET) {
+  console.warn("⚠️  GitHub OAuth not configured — /auth/github endpoints will be disabled until GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET are set.");
+}
