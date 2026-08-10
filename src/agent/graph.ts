@@ -1,4 +1,4 @@
-import { Command, END, INTERRUPT, START, StateGraph, isInterrupted } from "@langchain/langgraph";
+import { Command, END, START, StateGraph } from "@langchain/langgraph";
 import { getCheckpointer } from "./checkpointer.js";
 import { createPr, draftDocs, explore, fetchTree, review, selectFiles } from "./nodes.js";
 import { AgentState, type AgentStateType } from "./state.js";
@@ -64,14 +64,11 @@ export async function* runAgent({
   });
 
   for await (const rawChunk of stream as AsyncIterable<unknown>) {
-    const chunk = rawChunk as [string[], string, unknown];
-
-    if (!Array.isArray(chunk) || chunk.length < 2) {
+    if (!Array.isArray(rawChunk) || rawChunk.length < 2) {
       continue;
     }
 
-    const mode = chunk[1];
-    const payload = chunk[2];
+    const [mode, payload] = rawChunk as [string, unknown];
 
     if (mode === "messages") {
       const pair = payload as [unknown, unknown];
@@ -84,18 +81,14 @@ export async function* runAgent({
 
     if (mode === "updates") {
       const update = payload as Record<string, unknown>;
+      if (update && typeof update === "object" && "__interrupt__" in update) {
+        const list = update.__interrupt__ as { value?: Record<string, unknown> }[];
+        yield { type: "interrupt", data: (list?.[0]?.value ?? {}) as Record<string, unknown> };
+        continue;
+      }
       const node = Object.keys(update)[0];
       if (!node) continue;
-      const data = update[node];
-      if (data && typeof data === "object" && isInterrupted(data)) {
-        const first = (data as Record<string | symbol, unknown>)[INTERRUPT] as {
-          value?: Record<string, unknown>;
-        }[];
-        const payload = first?.[0]?.value;
-        yield { type: "interrupt", node, data: (payload ?? {}) as Record<string, unknown> };
-      } else {
-        yield { type: "node", node, data: (data ?? {}) as Record<string, unknown> };
-      }
+      yield { type: "node", node, data: (update[node] ?? {}) as Record<string, unknown> };
     }
   }
 

@@ -12,6 +12,7 @@ import { prisma } from "../db/prisma.js";
 import { getOctokit } from "../github/client.js";
 import { createChatModel } from "../models/registry.js";
 import { draftDocsPrompt, explorePrompt, selectFilesPrompt } from "./prompts.js";
+import { modelCall } from "./retry.js";
 import type { AgentStateType, DraftDoc, ExploredFile, PrResult } from "./state.js";
 import { buildTools, getRepoTree, MAX_DRAFTS, MAX_READS, type ToolContext } from "./tools.js";
 
@@ -57,10 +58,10 @@ export async function selectFiles(state: AgentStateType) {
   const model = createChatModel(state.provider!, state.model!);
   const structured = model.withStructuredOutput(fileSelectionSchema, { name: "select_files" });
 
-  const result = await structured.invoke([
+  const result = (await modelCall(structured, [
     new SystemMessage(selectFilesPrompt(state)),
     new HumanMessage(state.userMessage),
-  ]);
+  ])) as { files: { path: string; reason: string }[] };
 
   const summary = new AIMessage(
     `Selected ${result.files.length} file(s) to explore:\n${result.files.map((f) => `- ${f.path}`).join("\n")}`,
@@ -70,9 +71,10 @@ export async function selectFiles(state: AgentStateType) {
 
 export async function explore(state: AgentStateType, config: RunnableConfig) {
   const ctx = await getCtx(state, config);
-  const { readFile, tools } = buildTools(ctx);
+  const { readFile } = buildTools(ctx);
+  const tools = [readFile];
   const toolMap = new Map<string, ToolInvoker>(
-    tools.map((t) => [t.name, t.invoke as unknown as ToolInvoker]),
+    tools.map((t) => [t.name, t.invoke.bind(t) as unknown as ToolInvoker]),
   );
 
   const model = createChatModel(state.provider!, state.model!).bindTools!(tools);
@@ -88,7 +90,7 @@ export async function explore(state: AgentStateType, config: RunnableConfig) {
   const seen = new Set(explored.map((f) => f.path));
 
   for (let round = 0; round < 6; round++) {
-    const res = await model.invoke(local);
+    const res = (await modelCall(model, local)) as AIMessage;
     local.push(res);
 
     const calls = res.tool_calls ?? [];
@@ -130,9 +132,10 @@ export async function explore(state: AgentStateType, config: RunnableConfig) {
 
 export async function draftDocs(state: AgentStateType, config: RunnableConfig) {
   const ctx = await getCtx(state, config);
-  const { tools } = buildTools(ctx);
+  const { writeDocDraft } = buildTools(ctx);
+  const tools = [writeDocDraft];
   const toolMap = new Map<string, ToolInvoker>(
-    tools.map((t) => [t.name, t.invoke as unknown as ToolInvoker]),
+    tools.map((t) => [t.name, t.invoke.bind(t) as unknown as ToolInvoker]),
   );
 
   const model = createChatModel(state.provider!, state.model!).bindTools!(tools);
@@ -147,7 +150,7 @@ export async function draftDocs(state: AgentStateType, config: RunnableConfig) {
   let draftCount = state.drafts.length;
 
   for (let round = 0; round < 8; round++) {
-    const res = await model.invoke(local);
+    const res = (await modelCall(model, local)) as AIMessage;
     local.push(res);
 
     const calls = res.tool_calls ?? [];
