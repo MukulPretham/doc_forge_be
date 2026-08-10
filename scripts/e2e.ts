@@ -2,22 +2,38 @@ import { Command } from "@langchain/langgraph";
 import { runAgent } from "../src/agent/graph.js";
 import { prisma } from "../src/db/prisma.js";
 
+async function withRetry<T>(fn: () => Promise<T>, attempts = 6): Promise<T> {
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      return await fn();
+    } catch (err) {
+      if (i === attempts) throw err;
+      console.error(`  (neon retry ${i}/${attempts - 1})`);
+      await new Promise((r) => setTimeout(r, 3000));
+    }
+  }
+  throw new Error("unreachable");
+}
+
 const step = process.argv[2] ?? "create";
-const user = await prisma.user.findFirstOrThrow({ where: { login: "MukulPretham" } });
+const user = await withRetry(() => prisma.user.findFirstOrThrow({ where: { login: "MukulPretham" } }));
 
 if (step === "create") {
+  const provider = process.argv[3] ?? "openrouter";
+  const model = process.argv[4] ?? "deepseek/deepseek-chat-v3-0324";
   const conversation = await prisma.conversation.create({
     data: {
       userId: user.id,
       repoOwner: "MukulPretham",
       repoName: "Express",
       branch: "main",
-      provider: "google_genai",
-      model: "gemini-2.5-flash",
+      provider,
+      model,
       status: "active",
     },
   });
   console.log("CONVERSATION_ID=" + conversation.id);
+  console.log("provider/model: " + provider + "/" + model);
   console.log("next: node --import tsx scripts/e2e.ts run " + conversation.id);
   await prisma.$disconnect();
   process.exit(0);
@@ -26,7 +42,9 @@ if (step === "create") {
 const conversationId = step === "run" || step === "push" ? process.argv[3] : undefined;
 if (!conversationId) throw new Error("conversation id required");
 
-const conversation = await prisma.conversation.findFirstOrThrow({ where: { id: conversationId } });
+const conversation = await withRetry(() =>
+  prisma.conversation.findFirstOrThrow({ where: { id: conversationId } }),
+);
 console.log(`conversation ${conversationId}: ${conversation.repoOwner}/${conversation.repoName} status=${conversation.status}`);
 
 const input =
