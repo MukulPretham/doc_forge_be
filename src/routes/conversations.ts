@@ -130,6 +130,18 @@ function sendAgentError(res: { write: (chunk: string) => boolean }, conversation
     .catch(() => {});
 }
 
+function startKeepalive(res: { write: (chunk: string) => boolean }) {
+  const interval = setInterval(() => {
+    try {
+      res.write(": keepalive\n\n");
+    } catch {
+      clearInterval(interval);
+    }
+  }, 10_000);
+  interval.unref?.();
+  return interval;
+}
+
 router.post("/:id/stream", requireAuth, async (req, res) => {
   const conversation = await loadConversationOrNull(String(req.params.id), req.user!.id);
   if (!conversation) {
@@ -155,6 +167,7 @@ router.post("/:id/stream", requireAuth, async (req, res) => {
   });
 
   sseHeaders(res);
+  const keepalive = startKeepalive(res);
 
   try {
     const threadId = conversation.id;
@@ -215,6 +228,7 @@ router.post("/:id/stream", requireAuth, async (req, res) => {
     sendAgentError(res, conversation.id, err);
   }
 
+  clearInterval(keepalive);
   res.end();
 });
 
@@ -228,6 +242,7 @@ router.post("/:id/push", requireAuth, async (req, res) => {
   }
 
   sseHeaders(res);
+  const keepalive = startKeepalive(res);
 
   try {
     await prisma.conversation.update({
@@ -278,6 +293,7 @@ router.post("/:id/push", requireAuth, async (req, res) => {
     sendAgentError(res, conversation.id, err);
   }
 
+  clearInterval(keepalive);
   res.end();
 });
 
