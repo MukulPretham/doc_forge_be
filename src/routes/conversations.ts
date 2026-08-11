@@ -139,7 +139,7 @@ function sendAgentError(res: { write: (chunk: string) => boolean }, conversation
 function startKeepalive(res: { write: (chunk: string) => boolean }) {
   const interval = setInterval(() => {
     try {
-      res.write(": keepalive\n\n");
+      res.write(`event: ping\ndata: {"t":${Date.now()}}\n\n`);
     } catch {
       clearInterval(interval);
     }

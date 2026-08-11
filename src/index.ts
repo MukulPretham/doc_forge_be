@@ -34,6 +34,17 @@ app.use("/models", modelsRoutes);
 app.use("/conversations", conversationsRoutes);
 app.use("/prs", prsRoutes);
 
-app.listen(config.PORT, () => {
+const server = app.listen(config.PORT, () => {
   log.ok(`docforge-backend listening on http://localhost:${config.PORT}`);
+});
+
+server.on("error", (err: NodeJS.ErrnoException) => {
+  if (err.code === "EADDRINUSE") {
+    console.error(
+      `\nPort ${config.PORT} is already in use by another docforge-backend instance.\n` +
+        `Stop the other instance first, then retry. (Find it with: lsof -i :${config.PORT})\n`,
+    );
+    process.exit(1);
+  }
+  throw err;
 });
