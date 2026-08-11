@@ -177,6 +177,12 @@ router.post("/:id/stream", requireAuth, async (req, res) => {
 
   sseHeaders(res);
   const keepalive = startKeepalive(res);
+  const abort = new AbortController();
+  let finished = false;
+  const onClose = () => {
+    if (!finished) abort.abort();
+  };
+  res.on("close", onClose);
 
   try {
     const threadId = conversation.id;
@@ -194,7 +200,7 @@ router.post("/:id/stream", requireAuth, async (req, res) => {
             authorEmail: req.user!.email ?? `${req.user!.login}@users.noreply.github.com`,
           };
 
-    for await (const event of runAgent({ threadId, input })) {
+    for await (const event of runAgent({ threadId, input, signal: abort.signal })) {
       if (event.type === "token") sendEvent(res, "token", { content: event.content });
       else if (event.type === "node") {
         log.info(`sse node conv=${threadId} → ${event.node}`);
@@ -236,15 +242,26 @@ router.post("/:id/stream", requireAuth, async (req, res) => {
     });
 
     sendEvent(res, "done", { status: finalStatus });
+    finished = true;
     log.ok(`stream done conv=${conversation.id} status=${finalStatus} storedMsgs=${fresh.length}`);
   } catch (err) {
-    console.error("Agent run failed:", err);
-    log.error(`stream error conv=${conversation.id} type=${(err as Error).name} msg=${(err as Error).message.slice(0, 200)}`);
-    sendAgentError(res, conversation.id, err);
+    if (abort.signal.aborted) {
+      log.warn(`stream aborted conv=${conversation.id} — client disconnected`);
+      await prisma.conversation.update({
+        where: { id: conversation.id },
+        data: { status: "active" },
+      });
+    } else {
+      console.error("Agent run failed:", err);
+      log.error(`stream error conv=${conversation.id} type=${(err as Error).name} msg=${(err as Error).message.slice(0, 200)}`);
+      finished = true;
+      sendAgentError(res, conversation.id, err);
+    }
+  } finally {
+    clearInterval(keepalive);
+    res.removeListener("close", onClose);
+    res.end();
   }
-
-  clearInterval(keepalive);
-  res.end();
 });
 
 router.post("/:id/push", requireAuth, async (req, res) => {
@@ -260,6 +277,12 @@ router.post("/:id/push", requireAuth, async (req, res) => {
   log.info(`push start conv=${conversation.id} by=${req.user!.login}`);
   sseHeaders(res);
   const keepalive = startKeepalive(res);
+  const abort = new AbortController();
+  let finished = false;
+  const onClose = () => {
+    if (!finished) abort.abort();
+  };
+  res.on("close", onClose);
 
   try {
     await prisma.conversation.update({
@@ -270,6 +293,7 @@ router.post("/:id/push", requireAuth, async (req, res) => {
     for await (const event of runAgent({
       threadId: conversation.id,
       input: new Command({ resume: { action: "push", feedback: "" } }),
+      signal: abort.signal,
     })) {
       if (event.type === "token") sendEvent(res, "token", { content: event.content });
       else if (event.type === "node") {
@@ -303,19 +327,30 @@ router.post("/:id/push", requireAuth, async (req, res) => {
 
     const prRow = await prisma.pullRequest.findUnique({ where: { conversationId: conversation.id } });
     log.ok(`push done conv=${conversation.id} pr=${prRow ? `#${prRow.number} ${prRow.url}` : "none"}`);
+    finished = true;
     sendEvent(res, "done", {
       status: "pr_open",
       prUrl: prRow?.url ?? null,
       prNumber: prRow?.number ?? null,
     });
   } catch (err) {
-    console.error("Push failed:", err);
-    log.error(`push error conv=${conversation.id} type=${(err as Error).name} msg=${(err as Error).message.slice(0, 200)}`);
-    sendAgentError(res, conversation.id, err);
+    if (abort.signal.aborted) {
+      log.warn(`push aborted conv=${conversation.id} — client disconnected`);
+      await prisma.conversation.update({
+        where: { id: conversation.id },
+        data: { status: "review" },
+      });
+    } else {
+      console.error("Push failed:", err);
+      log.error(`push error conv=${conversation.id} type=${(err as Error).name} msg=${(err as Error).message.slice(0, 200)}`);
+      finished = true;
+      sendAgentError(res, conversation.id, err);
+    }
+  } finally {
+    clearInterval(keepalive);
+    res.removeListener("close", onClose);
+    res.end();
   }
-
-  clearInterval(keepalive);
-  res.end();
 });
 
 export default router;

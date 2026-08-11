@@ -50,14 +50,16 @@ export interface AgentRunEvent {
 export interface RunAgentOptions {
   threadId: string;
   input: unknown;
+  signal?: AbortSignal;
 }
 
 export async function* runAgent({
   threadId,
   input,
+  signal,
 }: RunAgentOptions): AsyncGenerator<AgentRunEvent> {
   const graph = await getAgentGraph();
-  const config = { configurable: { thread_id: threadId }, recursionLimit: 50 };
+  const config = { configurable: { thread_id: threadId }, recursionLimit: 50, signal };
   const isResume = input instanceof Command;
   log.info(`agent ${isResume ? "resume" : "start"} thread=${threadId}`);
 

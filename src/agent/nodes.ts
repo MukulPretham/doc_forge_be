@@ -56,14 +56,14 @@ const fileSelectionSchema = z.object({
   ),
 });
 
-export async function selectFiles(state: AgentStateType) {
+export async function selectFiles(state: AgentStateType, config: RunnableConfig) {
   const model = createChatModel(state.provider!, state.model!);
   const structured = model.withStructuredOutput(fileSelectionSchema, { name: "select_files" });
 
   const result = (await modelCall(structured, [
     new SystemMessage(selectFilesPrompt(state)),
     new HumanMessage(state.userMessage),
-  ], state.provider!, state.model!)) as { files: { path: string; reason: string }[] };
+  ], state.provider!, state.model!, config.signal)) as { files: { path: string; reason: string }[] };
 
   const summary = new AIMessage(
     `Selected ${result.files.length} file(s) to explore:\n${result.files.map((f) => `- ${f.path}`).join("\n")}`,
@@ -93,7 +93,7 @@ export async function explore(state: AgentStateType, config: RunnableConfig) {
   const seen = new Set(explored.map((f) => f.path));
 
   for (let round = 0; round < 6; round++) {
-    const res = (await modelCall(model, local, state.provider!, state.model!)) as AIMessage;
+    const res = (await modelCall(model, local, state.provider!, state.model!, config.signal)) as AIMessage;
     local.push(res);
 
     const calls = res.tool_calls ?? [];
@@ -154,7 +154,7 @@ export async function draftDocs(state: AgentStateType, config: RunnableConfig) {
   let draftCount = state.drafts.length;
 
   for (let round = 0; round < 8; round++) {
-    const res = (await modelCall(model, local, state.provider!, state.model!)) as AIMessage;
+    const res = (await modelCall(model, local, state.provider!, state.model!, config.signal)) as AIMessage;
     local.push(res);
 
     const calls = res.tool_calls ?? [];
