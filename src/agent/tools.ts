@@ -121,5 +121,25 @@ export function buildTools(ctx: ToolContext) {
     },
   );
 
-  return { readFile, writeDocDraft, tools: [readFile, writeDocDraft] };
+  const deleteDocDraft = tool(
+    async ({ path }: { path: string }) => {
+      if (!path.startsWith("README.md") && !path.startsWith("docs/")) {
+        return { deleted: false, error: "Docs may only be deleted from README.md or paths under docs/" };
+      }
+      await prisma.docDraft.deleteMany({
+        where: { conversationId: ctx.conversationId, path, status: "draft" },
+      });
+      return { deleted: true, path };
+    },
+    {
+      name: "delete_doc_draft",
+      description:
+        "Remove a previously staged documentation draft (README.md or docs/...). Use this when a revision asks to merge, consolidate, or drop files — the file will no longer be part of the docs or the PR.",
+      schema: z.object({
+        path: z.string().describe("File path to delete, e.g. README.md or docs/architecture.md"),
+      }),
+    },
+  );
+
+  return { readFile, writeDocDraft, deleteDocDraft, tools: [readFile, writeDocDraft, deleteDocDraft] };
 }

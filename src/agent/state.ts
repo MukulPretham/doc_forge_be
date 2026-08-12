@@ -48,7 +48,8 @@ export const AgentState = Annotation.Root({
   drafts: Annotation<DraftDoc[]>({ reducer: (_a, b) => b, default: () => [] }),
   readCount: Annotation<number>({ reducer: (_a, b) => b, default: () => 0 }),
   feedback: Annotation<string>({ reducer: (_a, b) => b, default: () => "" }),
-  action: Annotation<"review" | "push">({ reducer: (_a, b) => b, default: () => "review" }),
+  action: Annotation<"review" | "push" | "answer">({ reducer: (_a, b) => b, default: () => "review" }),
+  intent: Annotation<"docs" | "answer">({ reducer: (_a, b) => b, default: () => "docs" }),
   prResult: Annotation<PrResult | undefined>({
     reducer: (_a, b) => b,
     default: () => undefined,

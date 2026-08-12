@@ -1,5 +1,5 @@
 import type { BaseMessage } from "@langchain/core/messages";
-import { Command } from "@langchain/langgraph";
+import { Command, END } from "@langchain/langgraph";
 import { Router } from "express";
 import { z } from "zod";
 import { getAgentGraph, runAgent } from "../agent/graph.js";
@@ -22,6 +22,49 @@ const createConversationSchema = z.object({
 
 function sendEvent(res: { write: (chunk: string) => boolean }, event: string, data: unknown) {
   res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+}
+
+async function persistUserVisibleMessages(
+  conversationId: string,
+  provider: string,
+  model: string,
+  checkpointMessages: BaseMessage[],
+): Promise<number> {
+  const fresh = checkpointMessages.filter((m) => {
+    if (typeof m.getType !== "function" || m.getType() !== "ai") return false;
+    if (typeof m.content !== "string" || m.content.trim().length === 0) return false;
+    const visible = (m.additional_kwargs as { __df?: { userVisible?: boolean } })?.__df?.userVisible === true;
+    return visible;
+  });
+  if (fresh.length === 0) return 0;
+  const existingRows = await prisma.message.findMany({
+    where: { conversationId },
+    select: { content: true },
+  });
+  const existingIds = new Set<string>();
+  for (const row of existingRows) {
+    const msgId = (row.content as { msgId?: string } | null)?.msgId;
+    if (msgId) existingIds.add(msgId);
+  }
+  const toPersist = fresh.filter((m) => {
+    const msgId = m.id;
+    return msgId ? !existingIds.has(msgId) : true;
+  });
+  if (toPersist.length === 0) return 0;
+  await prisma.message.createMany({
+    data: toPersist.map((m) => ({
+      conversationId,
+      role: "assistant",
+      provider,
+      model,
+      content: {
+        type: m.getType(),
+        text: typeof m.content === "string" ? m.content : JSON.stringify(m.content),
+        msgId: m.id,
+      },
+    })),
+  });
+  return toPersist.length;
 }
 
 router.post("/", requireAuth, async (req, res, next) => {
@@ -186,19 +229,26 @@ router.post("/:id/stream", requireAuth, async (req, res) => {
 
   try {
     const threadId = conversation.id;
-    const input =
-      conversation.status === "review"
-        ? new Command({ resume: message })
-        : {
-            userMessage: message,
-            repoOwner: conversation.repoOwner,
-            repoName: conversation.repoName,
-            branch: conversation.branch,
-            provider: conversation.provider,
-            model: conversation.model,
-            authorName: req.user!.name ?? req.user!.login,
-            authorEmail: req.user!.email ?? `${req.user!.login}@users.noreply.github.com`,
-          };
+    const graph = await getAgentGraph();
+    const preSnapshot = await graph.getState({ configurable: { thread_id: threadId } });
+    const pending = (preSnapshot.next as string[]) ?? [];
+    const canResume = conversation.status === "review" && pending.length > 0 && !pending.includes(END);
+    if (conversation.status === "review" && !canResume) {
+      log.warn(`stream conv=${threadId} marked review but graph has no pending interrupt (next=${pending.join(",")}) — running fresh`);
+    }
+    const input = canResume
+      ? new Command({ resume: message })
+      : {
+          userMessage: message,
+          feedback: "",
+          repoOwner: conversation.repoOwner,
+          repoName: conversation.repoName,
+          branch: conversation.branch,
+          provider: conversation.provider,
+          model: conversation.model,
+          authorName: req.user!.name ?? req.user!.login,
+          authorEmail: req.user!.email ?? `${req.user!.login}@users.noreply.github.com`,
+        };
 
     for await (const event of runAgent({ threadId, input, signal: abort.signal })) {
       if (event.type === "token") sendEvent(res, "token", { content: event.content });
@@ -211,31 +261,29 @@ router.post("/:id/stream", requireAuth, async (req, res) => {
       } else if (event.type === "end") sendEvent(res, "end", event.data ?? {});
     }
 
-    const graph = await getAgentGraph();
     const snapshot = await graph.getState({ configurable: { thread_id: threadId } });
     const messages = (snapshot.values as { messages: BaseMessage[] }).messages ?? [];
-
-    const storedCount = await prisma.message.count({
-      where: { conversationId: conversation.id, role: { not: "user" } },
-    });
-    const fresh = messages.slice(storedCount);
-    if (fresh.length > 0) {
-      await prisma.message.createMany({
-        data: fresh.map((m) => ({
-          conversationId: conversation.id,
-          role: "assistant",
-          provider: conversation.provider,
-          model: conversation.model,
-          content: {
-            type: m.getType(),
-            text: typeof m.content === "string" ? m.content : JSON.stringify(m.content),
-          },
-        })),
-      });
-    }
+    const stored = await persistUserVisibleMessages(
+      conversation.id,
+      conversation.provider,
+      conversation.model,
+      messages,
+    );
 
     const next = snapshot.next as string[];
-    const finalStatus = next.length === 0 ? "pr_open" : next.includes("review") ? "review" : "running";
+    const graphValues = snapshot.values as { prResult?: { url?: string } };
+    let finalStatus: string;
+    if (next.length === 0) {
+      const [prRow, draftCount] = await Promise.all([
+        prisma.pullRequest.findUnique({ where: { conversationId: conversation.id } }),
+        prisma.docDraft.count({ where: { conversationId: conversation.id, status: "draft" } }),
+      ]);
+      finalStatus = prRow || graphValues.prResult ? "pr_open" : draftCount > 0 ? "review" : "active";
+    } else if (next.includes("review")) {
+      finalStatus = "review";
+    } else {
+      finalStatus = "running";
+    }
     await prisma.conversation.update({
       where: { id: conversation.id },
       data: { status: finalStatus },
@@ -243,7 +291,7 @@ router.post("/:id/stream", requireAuth, async (req, res) => {
 
     sendEvent(res, "done", { status: finalStatus });
     finished = true;
-    log.ok(`stream done conv=${conversation.id} status=${finalStatus} storedMsgs=${fresh.length}`);
+    log.ok(`stream done conv=${conversation.id} status=${finalStatus} storedMsgs=${stored}`);
   } catch (err) {
     if (abort.signal.aborted) {
       log.warn(`stream aborted conv=${conversation.id} — client disconnected`);
@@ -306,24 +354,7 @@ router.post("/:id/push", requireAuth, async (req, res) => {
     const graph = await getAgentGraph();
     const snapshot = await graph.getState({ configurable: { thread_id: conversation.id } });
     const messages = (snapshot.values as { messages: BaseMessage[] }).messages ?? [];
-    const storedCount = await prisma.message.count({
-      where: { conversationId: conversation.id, role: { not: "user" } },
-    });
-    const fresh = messages.slice(storedCount);
-    if (fresh.length > 0) {
-      await prisma.message.createMany({
-        data: fresh.map((m) => ({
-          conversationId: conversation.id,
-          role: "assistant",
-          provider: conversation.provider,
-          model: conversation.model,
-          content: {
-            type: m.getType(),
-            text: typeof m.content === "string" ? m.content : JSON.stringify(m.content),
-          },
-        })),
-      });
-    }
+    await persistUserVisibleMessages(conversation.id, conversation.provider, conversation.model, messages);
 
     const prRow = await prisma.pullRequest.findUnique({ where: { conversationId: conversation.id } });
     log.ok(`push done conv=${conversation.id} pr=${prRow ? `#${prRow.number} ${prRow.url}` : "none"}`);

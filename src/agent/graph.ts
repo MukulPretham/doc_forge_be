@@ -1,11 +1,21 @@
 import { Command, END, START, StateGraph } from "@langchain/langgraph";
 import { getCheckpointer } from "./checkpointer.js";
-import { createPr, draftDocs, explore, fetchTree, review, selectFiles } from "./nodes.js";
+import { answerNode, createPr, draftDocs, explore, fetchTree, review, selectFiles, classifyIntent } from "./nodes.js";
 import { AgentState, type AgentStateType } from "./state.js";
 import { log } from "../logger.js";
 
-function routeAfterReview(state: AgentStateType): "review" | "push" {
-  return state.action === "push" ? "push" : "review";
+function routeAfterFetchTree(state: AgentStateType): "docs" | "answer" {
+  return state.intent === "answer" ? "answer" : "docs";
+}
+
+function routeAfterReview(state: AgentStateType): "review" | "push" | "answer" {
+  if (state.action === "push") return "push";
+  if (state.action === "answer") return "answer";
+  return "review";
+}
+
+function routeAfterAnswer(state: AgentStateType): string {
+  return state.drafts.length > 0 ? "review" : END;
 }
 
 export async function buildGraph() {
@@ -13,21 +23,32 @@ export async function buildGraph() {
 
   return new StateGraph(AgentState)
     .addNode("fetch_tree", fetchTree)
+    .addNode("classify_intent", classifyIntent)
     .addNode("select_files", selectFiles)
     .addNode("explore", explore)
     .addNode("draft_docs", draftDocs)
     .addNode("review", review)
+    .addNode("answer", answerNode)
     .addNode("create_pr", createPr)
     .addEdge(START, "fetch_tree")
-    .addEdge("fetch_tree", "select_files")
+    .addEdge("fetch_tree", "classify_intent")
+    .addConditionalEdges("classify_intent", routeAfterFetchTree, {
+      docs: "select_files",
+      answer: "answer",
+    })
     .addEdge("select_files", "explore")
     .addEdge("explore", "draft_docs")
     .addEdge("draft_docs", "review")
     .addConditionalEdges("review", routeAfterReview, {
       review: "draft_docs",
       push: "create_pr",
+      answer: "answer",
     })
     .addEdge("create_pr", END)
+    .addConditionalEdges("answer", routeAfterAnswer, {
+      review: "review",
+      [END]: END,
+    })
     .compile({ checkpointer });
 }
 
@@ -108,8 +129,15 @@ export async function* runAgent({
   }
 
   const snapshot = await graph.getState(config);
+  const next = snapshot.next as string[];
+  const values = snapshot.values as Record<string, unknown>;
+  const status = values.prResult
+    ? "pr_open"
+    : next.includes("review")
+      ? "review"
+      : "active";
   log.ok(
     `agent done thread=${threadId} node=${lastNode ?? "?"} tokens≈${Math.round(tokenCount / 4)} elapsed=${Date.now() - startedAt}ms`,
   );
-  yield { type: "end", data: { status: "pr_open", next: snapshot.next } };
+  yield { type: "end", data: { status, next } };
 }

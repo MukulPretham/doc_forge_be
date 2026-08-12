@@ -47,6 +47,7 @@ const providers: ProviderDefinition[] = [
       new ChatOpenAI({
         model,
         apiKey: config.OPENROUTER_API_KEY,
+        maxTokens: 8192,
         streaming: true,
         configuration: { baseURL: OPENROUTER_BASE_URL },
       }),

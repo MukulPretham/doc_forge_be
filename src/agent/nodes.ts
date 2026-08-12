@@ -12,7 +12,7 @@ import { prisma } from "../db/prisma.js";
 import { getOctokit } from "../github/client.js";
 import { log } from "../logger.js";
 import { createChatModel } from "../models/registry.js";
-import { draftDocsPrompt, explorePrompt, selectFilesPrompt } from "./prompts.js";
+import { draftDocsPrompt, answerPrompt, classifyIntentPrompt, explorePrompt, selectFilesPrompt } from "./prompts.js";
 import { modelCall } from "./retry.js";
 import type { AgentStateType, DraftDoc, ExploredFile, PrResult } from "./state.js";
 import { buildTools, getRepoTree, MAX_DRAFTS, MAX_READS, type ToolContext } from "./tools.js";
@@ -55,6 +55,63 @@ const fileSelectionSchema = z.object({
     }),
   ),
 });
+
+function heuristicIntent(text: string): "docs" | "answer" | undefined {
+  const t = text.trim().toLowerCase();
+  const docsRe =
+    /\b(generate|draft|write|create|update|improve|fix|revise|add|rewrite|build|make|produce)\b.*\b(doc|docs|documentation|readme|guide|comments-as-docs)\b|\b(doc|docs|documentation|readme)\b.*\b(improve|update|fix|rewrite|generate|draft|write|create)\b/;
+  if (docsRe.test(t)) return "docs";
+  if (/[?]|\b(what|how|why|which|does|is|can|where|when|who|tell|describe|explain|about)\b/.test(t)) return "answer";
+  return undefined;
+}
+
+function requestedDocPaths(feedback: string): string[] {
+  const out = new Set<string>();
+  const re = /\b((?:docs\/)?[\w./@-]+\.md)\b/gi;
+  for (const m of feedback.matchAll(re)) {
+    if (m[1]) out.add(m[1]);
+  }
+  return [...out];
+}
+
+async function classifyIntentImpl(
+  state: AgentStateType,
+  config: RunnableConfig,
+  text: string,
+): Promise<"docs" | "answer"> {
+  const heuristic = heuristicIntent(text);
+  if (heuristic) {
+    log.info(`classify_intent thread=${threadId(config)} heuristic → ${heuristic}`);
+    return heuristic;
+  }
+  const model = createChatModel(state.provider!, state.model!);
+  try {
+    const result = (await modelCall(
+      model,
+      [new SystemMessage(classifyIntentPrompt()), new HumanMessage(text)],
+      state.provider!,
+      state.model!,
+      config.signal,
+    )) as AIMessage;
+    const out = String(result.content ?? "").trim().toLowerCase();
+    const match = out.match(/\b(docs|answer)\b/);
+    const intent = match?.[1] === "answer" ? "answer" : "docs";
+    log.info(`classify_intent thread=${threadId(config)} raw="${out.slice(0, 80)}" → ${intent}`);
+    return intent;
+  } catch (err) {
+    log.warn(
+      `classify_intent failed thread=${threadId(config)} — defaulting to docs (${(err as Error).message.slice(0, 120)})`,
+    );
+    return "docs";
+  }
+}
+
+export async function classifyIntent(state: AgentStateType, config: RunnableConfig) {
+  const text = state.feedback || state.userMessage;
+  const intent = await classifyIntentImpl(state, config, text);
+  log.info(`node classify_intent thread=${threadId(config)} → ${intent}`);
+  return { intent, text };
+}
 
 export async function selectFiles(state: AgentStateType, config: RunnableConfig) {
   const model = createChatModel(state.provider!, state.model!);
@@ -136,8 +193,8 @@ export async function explore(state: AgentStateType, config: RunnableConfig) {
 
 export async function draftDocs(state: AgentStateType, config: RunnableConfig) {
   const ctx = await getCtx(state, config);
-  const { writeDocDraft } = buildTools(ctx);
-  const tools = [writeDocDraft];
+  const { writeDocDraft, deleteDocDraft } = buildTools(ctx);
+  const tools = [writeDocDraft, deleteDocDraft];
   const toolMap = new Map<string, ToolInvoker>(
     tools.map((t) => [t.name, t.invoke.bind(t) as unknown as ToolInvoker]),
   );
@@ -146,31 +203,27 @@ export async function draftDocs(state: AgentStateType, config: RunnableConfig) {
   const local: BaseMessage[] = [
     new SystemMessage(draftDocsPrompt(state)),
     ...state.messages.slice(-10),
-    new HumanMessage(state.userMessage),
+    new HumanMessage(state.feedback || state.userMessage),
   ];
   const baseLen = local.length;
 
   const drafts = new Map<string, DraftDoc>(state.drafts.map((d) => [d.path, d]));
+  const writtenPaths = new Set<string>();
   let draftCount = state.drafts.length;
 
-  for (let round = 0; round < 8; round++) {
-    const res = (await modelCall(model, local, state.provider!, state.model!, config.signal)) as AIMessage;
-    local.push(res);
-
-    const calls = res.tool_calls ?? [];
-    if (calls.length === 0) break;
-
-    for (const call of calls) {
-      if (!call.id || call.name !== "write_doc_draft") continue;
-      if (draftCount >= MAX_DRAFTS) {
-        local.push(new ToolMessage({ content: "Draft limit reached; stop writing.", tool_call_id: call.id }));
-        continue;
-      }
-      const fn = toolMap.get(call.name);
-      if (!fn) continue;
-      let output: string;
-      try {
-        const args = call.args as { path?: string; content?: string };
+  const handleCall = async (call: unknown) => {
+    const c = call as { id?: string; name?: string; args?: { path?: string; content?: string } };
+    if (!c.id) return;
+    const fn = toolMap.get(c.name!);
+    if (!fn) return;
+    let output: string;
+    try {
+      const args = c.args as { path?: string; content?: string };
+      if (c.name === "write_doc_draft") {
+        if (draftCount >= MAX_DRAFTS) {
+          local.push(new ToolMessage({ content: "Draft limit reached; stop writing.", tool_call_id: c.id }));
+          return;
+        }
         if (!args.path || !args.content) throw new Error("write_doc_draft requires path and content");
         const result = (await fn({ path: args.path, content: args.content })) as {
           saved: boolean;
@@ -179,12 +232,98 @@ export async function draftDocs(state: AgentStateType, config: RunnableConfig) {
         output = JSON.stringify(result);
         if (result.saved) {
           drafts.set(args.path, { path: args.path, content: args.content });
+          writtenPaths.add(args.path);
           if (!state.drafts.some((d) => d.path === args.path)) draftCount++;
         }
-      } catch (err) {
-        output = `Error: ${(err as Error).message}`;
+      } else if (c.name === "delete_doc_draft") {
+        if (!args.path) throw new Error("delete_doc_draft requires path");
+        const result = (await fn({ path: args.path })) as { deleted: boolean; error?: string };
+        output = JSON.stringify(result);
+        if (result.deleted) {
+          drafts.delete(args.path);
+          if (!state.drafts.some((d) => d.path === args.path)) draftCount = Math.max(0, draftCount - 1);
+        }
+      } else {
+        return;
       }
-      local.push(new ToolMessage({ content: output, tool_call_id: call.id }));
+    } catch (err) {
+      output = `Error: ${(err as Error).message}`;
+    }
+    local.push(new ToolMessage({ content: output, tool_call_id: c.id }));
+  };
+
+  const think = async (): Promise<AIMessage> =>
+    (await modelCall(model, local, state.provider!, state.model!, config.signal)) as AIMessage;
+
+  for (let round = 0; round < 8; round++) {
+    const res = await think();
+    local.push(res);
+    const calls = res.tool_calls ?? [];
+    if (calls.length === 0) break;
+    for (const call of calls) await handleCall(call);
+  }
+
+  const negativeRevision =
+    /\b(remove|delete|drop|don'?t|do not|skip|avoid|without|no longer|never)\b/i.test(state.feedback ?? "");
+  if (state.feedback && !negativeRevision) {
+    const staged = new Set([...drafts.keys()].map((p) => p.toLowerCase()));
+    const missing = requestedDocPaths(state.feedback).filter((p) => !staged.has(p.toLowerCase()));
+    if (missing.length > 0) {
+      log.warn(`node draft_docs conv=${ctx.conversationId} nudge: creating ${missing.join(",")}`);
+      local.push(
+        new HumanMessage(
+          `The user explicitly requested the following file(s), which you have not created yet: ${missing.join(", ")}. Call write_doc_draft for each of them now with full markdown content.`,
+        ),
+      );
+      for (let round = 0; round < 3; round++) {
+        const res = await think();
+        local.push(res);
+        const calls = res.tool_calls ?? [];
+        if (calls.length === 0) break;
+        for (const call of calls) await handleCall(call);
+        const stagedNow = new Set([...drafts.keys()].map((p) => p.toLowerCase()));
+        if (missing.every((p) => stagedNow.has(p.toLowerCase()))) break;
+      }
+    }
+  }
+
+  const consolidationRequest = (state.feedback ?? "").match(
+    /\b(merge|combine|consolidate|join|unify)\b|\b(all|everything|whole)\b.*\b(one|single|only)\b.*\bfile\b|\b(one|single)\b.*\bfile\b/i,
+  );
+  log.info(
+    `node draft_docs conv=${ctx.conversationId} feedback="${(state.feedback ?? "").slice(0, 60)}" written=${writtenPaths.size} consolidation=${!!consolidationRequest}`,
+  );
+  if (consolidationRequest) {
+    const primary = drafts.has("README.md")
+      ? "README.md"
+      : writtenPaths.size > 0
+        ? (writtenPaths.values().next().value as string)
+        : (drafts.keys().next().value as string | undefined);
+    if (primary) {
+      if (writtenPaths.size === 0) {
+        const others = [...drafts.keys()].filter((p) => p !== primary);
+        if (others.length > 0) {
+          const merged = [
+            drafts.get(primary)!.content,
+            ...others.map(
+              (p) => `\n\n---\n\n# ${p.replace(/\.md$/, "").replace(/^docs\//, "")}\n\n${drafts.get(p)!.content}`,
+            ),
+          ].join("");
+          await prisma.docDraft.upsert({
+            where: { conversationId_path: { conversationId: ctx.conversationId, path: primary } },
+            update: { content: merged, status: "draft" },
+            create: { conversationId: ctx.conversationId, path: primary, content: merged, status: "draft" },
+          });
+          drafts.set(primary, { path: primary, content: merged });
+          log.info(`node draft_docs conv=${ctx.conversationId} consolidated: merged into ${primary}`);
+        }
+      }
+      for (const [path] of drafts) {
+        if (path === primary) continue;
+        await prisma.docDraft.deleteMany({ where: { conversationId: ctx.conversationId, path, status: "draft" } });
+        drafts.delete(path);
+        log.info(`node draft_docs conv=${ctx.conversationId} consolidated: removed ${path}`);
+      }
     }
   }
 
@@ -193,25 +332,109 @@ export async function draftDocs(state: AgentStateType, config: RunnableConfig) {
   return { drafts: [...drafts.values()], messages: local.slice(baseLen) };
 }
 
-export async function review(state: AgentStateType) {
+export async function answerNode(state: AgentStateType, config: RunnableConfig) {
+  const ctx = await getCtx(state, config);
+  const { readFile } = buildTools(ctx);
+  const tools = [readFile];
+  const toolMap = new Map<string, ToolInvoker>(
+    tools.map((t) => [t.name, t.invoke.bind(t) as unknown as ToolInvoker]),
+  );
+
+  const model = createChatModel(state.provider!, state.model!).bindTools!(tools);
+  const question = state.feedback || state.userMessage;
+  const local: BaseMessage[] = [
+    new SystemMessage(answerPrompt(state)),
+    ...(question ? [new HumanMessage(question)] : []),
+  ];
+
+  const baseLen = local.length;
+  for (let round = 0; round < 4; round++) {
+    const res = (await modelCall(model, local, state.provider!, state.model!, config.signal)) as AIMessage;
+    local.push(res);
+
+    const calls = res.tool_calls ?? [];
+    if (calls.length === 0) break;
+
+    for (const call of calls) {
+      if (!call.id) continue;
+      if (call.name === "read_file") {
+        const fn = toolMap.get(call.name);
+        if (!fn) continue;
+        let output: string;
+        try {
+          const result = (await fn(call.args)) as {
+            path: string;
+            content?: string;
+            truncated?: boolean;
+            error?: string;
+          };
+          output = JSON.stringify(result);
+        } catch (err) {
+          output = `Error: ${(err as Error).message}`;
+        }
+        local.push(new ToolMessage({ content: output, tool_call_id: call.id }));
+      }
+    }
+  }
+
+  const replies = local
+    .slice(baseLen)
+    .filter((m): m is AIMessage => {
+      const type = typeof m.getType === "function" ? m.getType() : "";
+      const toolCalls = (m as { tool_calls?: unknown[] }).tool_calls ?? [];
+      return type === "ai" && toolCalls.length === 0 && String(m.content ?? "").trim().length > 0;
+    })
+    .slice(-1)
+    .map((m) => new AIMessage({ content: m.content, additional_kwargs: { ...m.additional_kwargs, __df: { userVisible: true } } }));
+  log.ok(`node answer conv=${ctx.conversationId} replyChars=${(replies[0]?.content ?? "").toString().length}`);
+  return { messages: replies };
+}
+
+function looksLikeQuestion(text: string): boolean {
+  const t = text.trim();
+  if (t.endsWith("?")) return true;
+  return /^(what|whats|what's|how|why|which|where|when|who|whom|whose|is|are|was|were|can|could|do|does|did|should|would|will|may|might|has|have|had|tell|explain|describe|summarize|walk|about|show)\b/i.test(
+    t,
+  );
+}
+
+export async function classifyResumeIntoAction(
+  state: AgentStateType,
+  config: RunnableConfig,
+  text: string,
+): Promise<{ action: "review" | "answer"; feedback: string }> {
+  const isQuestion = looksLikeQuestion(text);
+  log.info(
+    `classify_resume thread=${threadId(config)} question=${isQuestion} text="${text.slice(0, 60)}" → ${isQuestion ? "answer" : "review"}`,
+  );
+  if (isQuestion) return { action: "answer", feedback: text };
+  return { action: "review", feedback: text };
+}
+
+export async function review(state: AgentStateType, config: RunnableConfig) {
   const resume = interrupt({
     status: "review",
     drafts: state.drafts,
     message: "Drafts are ready. Reply with feedback to revise, or say 'push' to open a PR.",
   }) as string | { action?: string; feedback?: string } | undefined;
 
+  const pushWords = ["push", "publish", "approve", "go", "push it"];
+
   if (typeof resume === "string") {
-    const text = resume.trim().toLowerCase();
-    if (["push", "publish", "approve", "go", "push it"].includes(text) || text.includes("push")) {
+    const text = resume.trim();
+    if (text && (pushWords.includes(text.toLowerCase()) || text.toLowerCase().includes("push"))) {
       return { action: "push" as const, feedback: "" };
     }
-    return { action: "review" as const, feedback: resume };
+    if (text) return classifyResumeIntoAction(state, config, text);
+    return { action: "review" as const, feedback: "" };
   }
 
   if (resume?.action === "push") {
     return { action: "push" as const, feedback: resume.feedback ?? "" };
   }
-  return { action: "review" as const, feedback: resume?.feedback ?? "" };
+  const feedbackText = resume?.feedback?.trim() ?? "";
+  if (feedbackText) return classifyResumeIntoAction(state, config, feedbackText);
+  return { action: "review" as const, feedback: "" };
 }
 
 export async function createPr(state: AgentStateType, config: RunnableConfig) {
